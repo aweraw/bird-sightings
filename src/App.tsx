@@ -1,6 +1,7 @@
 import { Authenticated, Unauthenticated, useMutation, useQuery } from 'convex/react';
 import { api } from '../convex/_generated/api';
 import { useAuth } from '@workos-inc/authkit-react';
+import User from './user.tsx';
 
 export default function App() {
   return (
@@ -66,7 +67,7 @@ function Content() {
 
   return (
     <div className="flex flex-col gap-8 max-w-lg mx-auto">
-      <p>Welcome {viewer ?? 'Anonymous'}!</p>
+      <p><User /></p>
       <p>
         Click the button below and open this page in another window - this data is persisted in the Convex cloud
         database!

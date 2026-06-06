@@ -21,8 +21,10 @@ export const listNumbers = query({
       // Ordered by _creationTime, return most recent
       .order('desc')
       .take(args.count);
+    const viewer = await ctx.auth.getUserIdentity();
+    // console.log('Viewer:', viewer);
     return {
-      viewer: (await ctx.auth.getUserIdentity())?.subject ?? null,
+      viewer: viewer?.subject ?? null,
       numbers: numbers.reverse().map((number) => number.value),
     };
   },
