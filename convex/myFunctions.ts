@@ -1,6 +1,7 @@
 import { v } from 'convex/values';
 import { query, mutation, action } from './_generated/server';
 import { api } from './_generated/api';
+import { recordEvent } from './events';
 
 // Write your Convex functions in any file inside this directory (`convex`).
 // See https://docs.convex.dev/functions for more.
@@ -43,9 +44,22 @@ export const addNumber = mutation({
     //// Mutations can also read from the database like queries.
     //// See https://docs.convex.dev/database/writing-data.
 
-    const id = await ctx.db.insert('numbers', { value: args.value });
+    await ctx.db.insert('numbers', { value: args.value });
 
-    console.log('Added new document with id:', id);
+    // Real app-usage event, written in the same transaction as the insert.
+    const viewer = await ctx.auth.getUserIdentity();
+    const user = viewer
+      ? await ctx.db
+          .query('users')
+          .withIndex('by_tokenId', (q) => q.eq('tokenId', viewer.subject))
+          .first()
+      : null;
+    await recordEvent(ctx, {
+      type: 'number.added',
+      userId: user?._id,
+      metadata: { value: args.value },
+    });
+
     // Optionally, return a value from your mutation.
     // return id;
   },
