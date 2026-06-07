@@ -12,20 +12,30 @@ export default defineSchema({
     firstName: v.optional(v.string()),
     lastName: v.optional(v.string()),
   }).index('by_tokenId', ['tokenId']),
+  // An "outing": one user recorded birds at one location on one date.
+  // The species seen are stored in the sightingSpecies child table.
   sighting: defineTable({
     user: v.id('users'),
-    bird: v.id('species'),
     location: v.id('locations'),
-    date: v.string(),
-  }).index('by_sighting', ['user', 'bird', 'location', 'date']),
+    date: v.string(), // ISO 8601, e.g. "2026-06-07"
+  })
+    .index('by_user', ['user'])
+    .index('by_date', ['date']),
+  // Join table: which species were recorded on a given sighting.
+  sightingSpecies: defineTable({
+    sighting: v.id('sighting'),
+    species: v.id('species'),
+  })
+    .index('by_sighting', ['sighting'])
+    .index('by_species', ['species']),
   species: defineTable({
     name: v.string(),
     description: v.string(),
-  }),
+  }).index('by_name', ['name']),
   locations: defineTable({
     name: v.string(),
     description: v.string(),
-  }),
+  }).index('by_name', ['name']),
   events: defineTable({
     type: v.string(), // e.g. "sighting.created", "number.added", "http.request"
     userId: v.optional(v.id('users')),

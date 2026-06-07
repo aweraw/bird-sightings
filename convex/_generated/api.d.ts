@@ -10,7 +10,10 @@
 
 import type * as events from "../events.js";
 import type * as http from "../http.js";
-import type * as myFunctions from "../myFunctions.js";
+import type * as locations from "../locations.js";
+import type * as seed from "../seed.js";
+import type * as sightings from "../sightings.js";
+import type * as species from "../species.js";
 import type * as users from "../users.js";
 
 import type {
@@ -22,7 +25,10 @@ import type {
 declare const fullApi: ApiFromModules<{
   events: typeof events;
   http: typeof http;
-  myFunctions: typeof myFunctions;
+  locations: typeof locations;
+  seed: typeof seed;
+  sightings: typeof sightings;
+  species: typeof species;
   users: typeof users;
 }>;
 

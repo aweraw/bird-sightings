@@ -1,26 +1,57 @@
-import { Authenticated, Unauthenticated, useMutation, useQuery } from 'convex/react';
-import { api } from '../convex/_generated/api';
+import { useEffect } from 'react';
+import { Authenticated, Unauthenticated, useConvexAuth, useMutation } from 'convex/react';
+import { Routes, Route, Link } from 'react-router-dom';
 import { useAuth } from '@workos-inc/authkit-react';
+import { api } from '../convex/_generated/api';
 import User from './user.tsx';
+import SightingForm from './SightingForm.tsx';
+import RecentSightings from './RecentSightings.tsx';
+import MySightings from './MySightings.tsx';
+import Dashboard from './Dashboard.tsx';
+
+/**
+ * Ensure the current user's row exists (and emit the login event) on any
+ * authenticated route. Centralized here so it fires once per session
+ * regardless of which page the user lands on first.
+ */
+function useEnsureUser() {
+  const { isAuthenticated } = useConvexAuth();
+  const setUser = useMutation(api.users.setUser);
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    void setUser();
+  }, [isAuthenticated, setUser]);
+}
 
 export default function App() {
+  useEnsureUser();
   return (
     <>
       <header className="sticky top-0 z-10 bg-light dark:bg-dark p-4 border-b-2 border-slate-200 dark:border-slate-800 flex flex-row justify-between items-center">
-        Convex + React + WorkOS AuthKit
+        <div className="flex items-center gap-4">
+          <Link to="/" className="font-bold">
+            Bird Sightings App
+          </Link>
+          <Authenticated>
+            <nav className="flex gap-3 text-sm">
+              <Link to="/my-sightings" className="underline hover:no-underline">
+                My sightings
+              </Link>
+              <Link to="/dashboard" className="underline hover:no-underline">
+                Dashboard
+              </Link>
+            </nav>
+          </Authenticated>
+        </div>
         <AuthButton />
       </header>
       <main className="p-8 flex flex-col gap-16">
-        <h1 className="text-4xl font-bold text-center">Convex + React + WorkOS AuthKit</h1>
-        <Authenticated>
-          <Content />
-        </Authenticated>
-        <Unauthenticated>
-          <div className="flex flex-col gap-8 w-96 mx-auto">
-            <p>Log in to see the numbers</p>
-            <AuthButton />
-          </div>
-        </Unauthenticated>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/my-sightings" element={<MySightings />} />
+          <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="*" element={<Home />} />
+        </Routes>
       </main>
     </>
   );
@@ -50,95 +81,20 @@ function AuthButton() {
   );
 }
 
-function Content() {
-  const { viewer, numbers } =
-    useQuery(api.myFunctions.listNumbers, {
-      count: 10,
-    }) ?? {};
-  const addNumber = useMutation(api.myFunctions.addNumber);
-
-  if (viewer === undefined || numbers === undefined) {
-    return (
-      <div className="mx-auto">
-        <p>loading... (consider a loading skeleton)</p>
-      </div>
-    );
-  }
-
+function Home() {
   return (
-    <div className="flex flex-col gap-8 max-w-lg mx-auto">
-      <p><User /></p>
-      <p>
-        Click the button below and open this page in another window - this data is persisted in the Convex cloud
-        database!
-      </p>
-      <p>
-        <button
-          className="bg-dark dark:bg-light text-light dark:text-dark text-sm px-4 py-2 rounded-md border-2"
-          onClick={() => {
-            void addNumber({ value: Math.floor(Math.random() * 10) });
-          }}
-        >
-          Add a random number
-        </button>
-      </p>
-      <p>Numbers: {numbers?.length === 0 ? 'Click the button!' : (numbers?.join(', ') ?? '...')}</p>
-      <p>
-        Edit{' '}
-        <code className="text-sm font-bold font-mono bg-slate-200 dark:bg-slate-800 px-1 py-0.5 rounded-md">
-          convex/myFunctions.ts
-        </code>{' '}
-        to change your backend
-      </p>
-      <p>
-        Edit{' '}
-        <code className="text-sm font-bold font-mono bg-slate-200 dark:bg-slate-800 px-1 py-0.5 rounded-md">
-          src/App.tsx
-        </code>{' '}
-        to change your frontend
-      </p>
-      <div className="flex flex-col">
-        <p className="text-lg font-bold">Useful resources:</p>
-        <div className="flex gap-2">
-          <div className="flex flex-col gap-2 w-1/2">
-            <ResourceCard
-              title="Convex docs"
-              description="Read comprehensive documentation for all Convex features."
-              href="https://docs.convex.dev/home"
-            />
-            <ResourceCard
-              title="Stack articles"
-              description="Learn about best practices, use cases, and more from a growing
-            collection of articles, videos, and walkthroughs."
-              href="https://www.typescriptlang.org/docs/handbook/2/basic-types.html"
-            />
-          </div>
-          <div className="flex flex-col gap-2 w-1/2">
-            <ResourceCard
-              title="Templates"
-              description="Browse our collection of templates to get started quickly."
-              href="https://www.convex.dev/templates"
-            />
-            <ResourceCard
-              title="Discord"
-              description="Join our developer community to ask questions, trade tips & tricks,
-            and show off your projects."
-              href="https://www.convex.dev/community"
-            />
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ResourceCard({ title, description, href }: { title: string; description: string; href: string }) {
-  return (
-    <div className="flex flex-col gap-2 bg-slate-200 dark:bg-slate-800 p-4 rounded-md h-28 overflow-auto">
-      <a href={href} className="text-sm underline hover:no-underline">
-        {title}
-      </a>
-      <p className="text-xs">{description}</p>
+    <div className="flex flex-col gap-8 max-w-3xl w-full mx-auto">
+      <User />
+      <Authenticated>
+        <SightingForm />
+      </Authenticated>
+      <Unauthenticated>
+        <p>Please sign in to create a new sighting.</p>
+      </Unauthenticated>
+      <section className="flex flex-col gap-4">
+        <h2 className="text-2xl font-bold">Recent sightings</h2>
+        <RecentSightings />
+      </section>
     </div>
   );
 }

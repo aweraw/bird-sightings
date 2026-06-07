@@ -68,37 +68,82 @@ export const logEvent = internalMutation({
   },
 });
 
+/**
+ * Public, client-callable writer for the one event a query can't record
+ * itself: a view. Queries are read-only, so the recent-sightings list fires
+ * this (fire-and-forget) on mount. userId is derived server-side and the type
+ * is fixed here — the client can't spoof either.
+ */
+export const logView = mutation({
+  args: { metadata: v.optional(v.any()) },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return; // ignore anonymous views
+    const user = await ctx.db
+      .query('users')
+      .withIndex('by_tokenId', (q) => q.eq('tokenId', identity.subject))
+      .first();
+    await recordEvent(ctx, {
+      type: 'sighting.viewed',
+      userId: user?._id,
+      metadata: args.metadata,
+    });
+  },
+});
+
 // ---------------------------------------------------------------------------
-// Simulation — seed the table so the dashboard has something to chart.
-// DEV/SEED TOOL: this is a public mutation for convenience (run it from the
-// Convex dashboard's function runner). Remove or guard it before production.
+// Backfill — synthetic event history for the dashboard. Internal-only: run via
+// `npx convex run events:backfillEvents '{...}'` or the seed:seedAll
+// orchestrator. References seeded synthetic users/sightings so login + sighting
+// events point at real rows, and tags every row metadata.synthetic for clean
+// teardown. Keep per-call counts modest; seedAll chunks larger volumes.
 // ---------------------------------------------------------------------------
 
-export const simulate = mutation({
+const SYNTHETIC_PREFIX = 'synthetic:';
+
+export const backfillEvents = internalMutation({
   args: {
-    count: v.optional(v.number()), // default 200
-    windowHours: v.optional(v.number()), // spread events across the past N hours
+    count: v.optional(v.number()),
+    days: v.optional(v.number()), // spread events across the past N days
   },
   handler: async (ctx, args) => {
-    const count = args.count ?? 200;
-    const windowMs = (args.windowHours ?? 24) * 60 * 60 * 1000;
+    const count = args.count ?? 250;
+    const windowMs = (args.days ?? 30) * 24 * 60 * 60 * 1000;
     const now = Date.now();
 
-    const appTypes = ['sighting.created', 'user.login', 'number.added', 'species.viewed'];
+    // Reference real seeded rows so events aren't orphaned.
+    const users = (await ctx.db.query('users').collect()).filter((u) =>
+      u.tokenId.startsWith(SYNTHETIC_PREFIX),
+    );
+    const userIds = new Set(users.map((u) => u._id));
+    const sightings = users.length
+      ? (await ctx.db.query('sighting').collect()).filter((s) => userIds.has(s.user))
+      : [];
+
     const routes = [
       { method: 'GET', path: '/api/sightings' },
       { method: 'POST', path: '/api/sightings' },
       { method: 'GET', path: '/api/species' },
       { method: 'GET', path: '/api/ping' },
     ];
+    // Weighted toward views; one entry per draw.
+    const appTypes = [
+      'sighting.viewed',
+      'sighting.viewed',
+      'sighting.created',
+      'user.login',
+      'sighting.updated',
+    ];
+    const pick = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
 
     for (let i = 0; i < count; i++) {
       const timestamp = now - Math.floor(Math.random() * windowMs);
       const errored = Math.random() < 0.08; // ~8% error rate
 
-      if (Math.random() < 0.5) {
-        // HTTP-request event
-        const route = routes[Math.floor(Math.random() * routes.length)];
+      // ~50% HTTP metrics (no user); the rest are app events tied to seeded
+      // users/sightings. With nothing seeded yet, everything falls back to HTTP.
+      if (users.length === 0 || Math.random() < 0.5) {
+        const route = pick(routes);
         await recordEvent(ctx, {
           type: 'http.request',
           status: errored ? 'error' : 'ok',
@@ -110,15 +155,22 @@ export const simulate = mutation({
           requestBytes: Math.round(Math.random() * 2048),
           responseBytes: Math.round(200 + Math.random() * 8192),
           errorMessage: errored ? 'Simulated failure' : undefined,
+          metadata: { synthetic: true },
         });
       } else {
-        // App-usage event
+        const type = pick(appTypes);
+        const sighting =
+          type.startsWith('sighting.') && sightings.length ? pick(sightings) : undefined;
+        const metadata: Record<string, unknown> = { synthetic: true };
+        if (sighting) metadata.sighting = sighting._id;
         await recordEvent(ctx, {
-          type: appTypes[Math.floor(Math.random() * appTypes.length)],
+          type,
           status: errored ? 'error' : 'ok',
           timestamp,
+          userId: sighting ? sighting.user : pick(users)._id,
           durationMs: Math.round(Math.random() * 50),
           errorMessage: errored ? 'Simulated failure' : undefined,
+          metadata,
         });
       }
     }
@@ -213,5 +265,77 @@ export const usageByType = query({
     return [...counts.entries()]
       .map(([type, count]) => ({ type, count }))
       .sort((a, b) => b.count - a.count);
+  },
+});
+
+/** Headline KPI numbers over the last N days. */
+export const dashboardSummary = query({
+  args: { days: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const from = Date.now() - (args.days ?? 30) * 24 * 60 * 60 * 1000;
+    const rows = await ctx.db
+      .query('events')
+      .withIndex('by_timestamp', (q) => q.gte('timestamp', from))
+      .collect();
+
+    let logins = 0;
+    let sightingsCreated = 0;
+    let httpRequests = 0;
+    let httpErrors = 0;
+    let latencySum = 0;
+    let latencyCount = 0;
+    const activeUsers = new Set<string>();
+
+    for (const e of rows) {
+      if (e.userId) activeUsers.add(e.userId);
+      if (e.type === 'user.login') logins++;
+      else if (e.type === 'sighting.created') sightingsCreated++;
+      else if (e.type === 'http.request') {
+        httpRequests++;
+        if (e.status === 'error') httpErrors++;
+        if (typeof e.durationMs === 'number') {
+          latencySum += e.durationMs;
+          latencyCount++;
+        }
+      }
+    }
+
+    return {
+      totalEvents: rows.length,
+      logins,
+      sightingsCreated,
+      activeUsers: activeUsers.size,
+      httpRequests,
+      httpErrorRate: httpRequests ? httpErrors / httpRequests : 0,
+      avgLatencyMs: latencyCount ? Math.round(latencySum / latencyCount) : 0,
+    };
+  },
+});
+
+/** Per-day counts of the main event types, for a time-series chart. */
+export const eventsByDay = query({
+  args: { days: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const from = Date.now() - (args.days ?? 30) * 24 * 60 * 60 * 1000;
+    const rows = await ctx.db
+      .query('events')
+      .withIndex('by_timestamp', (q) => q.gte('timestamp', from))
+      .collect();
+
+    const byDay = new Map<
+      string,
+      { date: string; logins: number; sightings: number; views: number; http: number }
+    >();
+    for (const e of rows) {
+      const date = new Date(e.timestamp).toISOString().slice(0, 10);
+      const b = byDay.get(date) ?? { date, logins: 0, sightings: 0, views: 0, http: 0 };
+      if (e.type === 'user.login') b.logins++;
+      else if (e.type === 'sighting.created') b.sightings++;
+      else if (e.type === 'sighting.viewed') b.views++;
+      else if (e.type === 'http.request') b.http++;
+      byDay.set(date, b);
+    }
+
+    return [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date));
   },
 });

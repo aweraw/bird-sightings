@@ -21,9 +21,13 @@
   },
   "dependencies": {
     "@workos-inc/authkit-react": "^0.16.1",
+    "clsx": "^2.1.1",
     "convex": "^1.36.1",
     "react": "^19.2.5",
-    "react-dom": "^19.2.5"
+    "react-dom": "^19.2.5",
+    "react-router-dom": "^7.17.0",
+    "recharts": "^3.8.1",
+    "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
     "@convex-dev/eslint-plugin": "^2.0.0",
