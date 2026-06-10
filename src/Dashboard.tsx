@@ -203,6 +203,42 @@ function HttpSection({ days }: { days: number }) {
     <section className="flex flex-col gap-4">
       <h3 className="text-xl font-bold">HTTP events</h3>
 
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <ChartCard title="Error rate / day">
+          <LineChart
+            data={errorRateByDay(byDay)}
+            index="label"
+            categories={['error %']}
+            colors={['#f43f5e']}
+            valueFormatter={(v) => `${v}%`}
+          />
+        </ChartCard>
+        <ChartCard title="Responses by status class / day">
+          <BarChart
+            data={statusClassByDay(byDay)}
+            index="label"
+            categories={['2xx', '4xx', '5xx']}
+            colors={['#10b981', '#f59e0b', '#f43f5e']}
+            valueFormatter={num}
+            stack
+          />
+        </ChartCard>
+      </div>
+
+      <ChartCard title="Latency percentiles / day">
+        <LineChart
+          data={pctData}
+          index="label"
+          categories={['p50', 'p95', 'p99']}
+          colors={['#3b82f6', '#f59e0b', '#f43f5e']}
+          valueFormatter={ms}
+        />
+      </ChartCard>
+
+      <ChartCard title="Avg latency per endpoint, per day">
+        <BarChart data={latencyGroupedByDay(byDay)} index="label" categories={endpoints} valueFormatter={ms} />
+      </ChartCard>
+
       <Card>
         <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
           <p className="font-bold">Status codes / day</p>
@@ -230,42 +266,6 @@ function HttpSection({ days }: { days: number }) {
 
       <ChartCard title="Errors / day by endpoint">
         <BarChart data={pivotByDay(byDay, 'errors')} index="label" categories={endpoints} valueFormatter={num} stack />
-      </ChartCard>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <ChartCard title="Error rate / day">
-          <LineChart
-            data={errorRateByDay(byDay)}
-            index="label"
-            categories={['error %']}
-            colors={['#f43f5e']}
-            valueFormatter={(v) => `${v}%`}
-          />
-        </ChartCard>
-        <ChartCard title="Responses by status class / day">
-          <BarChart
-            data={statusClassByDay(byDay)}
-            index="label"
-            categories={['2xx', '4xx', '5xx']}
-            colors={['#10b981', '#f59e0b', '#f43f5e']}
-            valueFormatter={num}
-            stack
-          />
-        </ChartCard>
-      </div>
-
-      <ChartCard title="Avg latency per endpoint, per day">
-        <BarChart data={latencyGroupedByDay(byDay)} index="label" categories={endpoints} valueFormatter={ms} />
-      </ChartCard>
-
-      <ChartCard title="Latency percentiles / day">
-        <LineChart
-          data={pctData}
-          index="label"
-          categories={['p50', 'p95', 'p99']}
-          colors={['#3b82f6', '#f59e0b', '#f43f5e']}
-          valueFormatter={ms}
-        />
       </ChartCard>
 
       <ChartCard title="Requests / day by endpoint">
