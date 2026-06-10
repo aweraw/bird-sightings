@@ -198,85 +198,100 @@ export const listRecent = query({
   },
 });
 
+// ---------------------------------------------------------------------------
+// Dashboard aggregations — SYNTHETIC events only (metadata.synthetic === true),
+// so the demo charts don't get skewed by your own real activity. Read-time
+// aggregation over a bounded window; fine at demo scale. Endpoint = method+path.
+// ---------------------------------------------------------------------------
+
+const isSynthetic = (e: { metadata?: unknown }) =>
+  (e.metadata as { synthetic?: boolean } | undefined)?.synthetic === true;
+
+const endpointLabel = (e: { method?: string; path?: string }) =>
+  `${e.method ?? '?'} ${e.path ?? '?'}`;
+
 /**
- * Time-bucketed HTTP metrics (request volume, error rate, avg latency, bytes)
- * shaped as an array ready to hand straight to recharts/tremor.
+ * Per-day, per-endpoint HTTP aggregates: requests, errors, bytes, latency, and
+ * a status-code breakdown. Drives every HTTP chart (latency grouped-per-day,
+ * stacked requests/errors/bytes, and per-day status for a selected endpoint).
  */
-export const httpMetrics = query({
-  args: {
-    windowHours: v.optional(v.number()),
-    bucketMinutes: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    const from = Date.now() - (args.windowHours ?? 24) * 60 * 60 * 1000;
-    const bucketMs = (args.bucketMinutes ?? 60) * 60 * 1000;
-
-    const rows = await ctx.db
-      .query('events')
-      .withIndex('by_type_and_timestamp', (q) =>
-        q.eq('type', 'http.request').gte('timestamp', from),
-      )
-      .collect();
-
-    const buckets = new Map<
-      number,
-      { requests: number; errors: number; durationSum: number; bytes: number }
-    >();
-    for (const e of rows) {
-      const bucket = Math.floor(e.timestamp / bucketMs) * bucketMs;
-      const agg =
-        buckets.get(bucket) ?? { requests: 0, errors: 0, durationSum: 0, bytes: 0 };
-      agg.requests += 1;
-      if (e.status === 'error') agg.errors += 1;
-      agg.durationSum += e.durationMs ?? 0;
-      agg.bytes += (e.requestBytes ?? 0) + (e.responseBytes ?? 0);
-      buckets.set(bucket, agg);
-    }
-
-    return [...buckets.entries()]
-      .sort(([a], [b]) => a - b)
-      .map(([bucket, agg]) => ({
-        bucket, // ms epoch — format on the client
-        requests: agg.requests,
-        errors: agg.errors,
-        errorRate: agg.requests ? agg.errors / agg.requests : 0,
-        avgDurationMs: agg.requests ? Math.round(agg.durationSum / agg.requests) : 0,
-        bytes: agg.bytes,
-      }));
-  },
-});
-
-/** Event counts grouped by type over a time window, for app-usage charts. */
-export const usageByType = query({
-  args: { windowHours: v.optional(v.number()) },
-  handler: async (ctx, args) => {
-    const from = Date.now() - (args.windowHours ?? 24) * 60 * 60 * 1000;
-
-    const rows = await ctx.db
-      .query('events')
-      .withIndex('by_timestamp', (q) => q.gte('timestamp', from))
-      .collect();
-
-    const counts = new Map<string, number>();
-    for (const e of rows) {
-      counts.set(e.type, (counts.get(e.type) ?? 0) + 1);
-    }
-
-    return [...counts.entries()]
-      .map(([type, count]) => ({ type, count }))
-      .sort((a, b) => b.count - a.count);
-  },
-});
-
-/** Headline KPI numbers over the last N days. */
-export const dashboardSummary = query({
+export const httpByDay = query({
   args: { days: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const from = Date.now() - (args.days ?? 30) * 24 * 60 * 60 * 1000;
-    const rows = await ctx.db
-      .query('events')
-      .withIndex('by_timestamp', (q) => q.gte('timestamp', from))
-      .collect();
+    const rows = (
+      await ctx.db
+        .query('events')
+        .withIndex('by_type_and_timestamp', (q) =>
+          q.eq('type', 'http.request').gte('timestamp', from),
+        )
+        .collect()
+    ).filter(isSynthetic);
+
+    const endpoints = new Set<string>();
+    const statusCodes = new Set<number>();
+    const byKey = new Map<
+      string,
+      {
+        date: string;
+        endpoint: string;
+        requests: number;
+        errors: number;
+        responseBytes: number;
+        latencySum: number;
+        latencyCount: number;
+        status: Record<string, number>;
+      }
+    >();
+    for (const e of rows) {
+      const endpoint = endpointLabel(e);
+      endpoints.add(endpoint);
+      const date = new Date(e.timestamp).toISOString().slice(0, 10);
+      const key = `${date}|${endpoint}`;
+      const agg = byKey.get(key) ?? {
+        date,
+        endpoint,
+        requests: 0,
+        errors: 0,
+        responseBytes: 0,
+        latencySum: 0,
+        latencyCount: 0,
+        status: {} as Record<string, number>,
+      };
+      agg.requests += 1;
+      if (e.status === 'error') agg.errors += 1;
+      agg.responseBytes += e.responseBytes ?? 0;
+      if (typeof e.durationMs === 'number') {
+        agg.latencySum += e.durationMs;
+        agg.latencyCount += 1;
+      }
+      if (typeof e.statusCode === 'number') {
+        const code = String(e.statusCode);
+        agg.status[code] = (agg.status[code] ?? 0) + 1;
+        statusCodes.add(e.statusCode);
+      }
+      byKey.set(key, agg);
+    }
+
+    return {
+      endpoints: [...endpoints].sort(),
+      statusCodes: [...statusCodes].sort((a, b) => a - b),
+      rows: [...byKey.values()].sort((a, b) => a.date.localeCompare(b.date)),
+    };
+  },
+});
+
+/** Headline KPI numbers (synthetic events only) over the last N days. */
+export const summary = query({
+  args: { days: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const from = Date.now() - (args.days ?? 30) * 24 * 60 * 60 * 1000;
+    const rows = (
+      await ctx.db
+        .query('events')
+        .withIndex('by_timestamp', (q) => q.gte('timestamp', from))
+        .collect()
+    ).filter(isSynthetic);
 
     let logins = 0;
     let sightingsCreated = 0;
@@ -302,40 +317,12 @@ export const dashboardSummary = query({
 
     return {
       totalEvents: rows.length,
+      activeUsers: activeUsers.size,
       logins,
       sightingsCreated,
-      activeUsers: activeUsers.size,
-      httpRequests,
       httpErrorRate: httpRequests ? httpErrors / httpRequests : 0,
       avgLatencyMs: latencyCount ? Math.round(latencySum / latencyCount) : 0,
     };
   },
 });
 
-/** Per-day counts of the main event types, for a time-series chart. */
-export const eventsByDay = query({
-  args: { days: v.optional(v.number()) },
-  handler: async (ctx, args) => {
-    const from = Date.now() - (args.days ?? 30) * 24 * 60 * 60 * 1000;
-    const rows = await ctx.db
-      .query('events')
-      .withIndex('by_timestamp', (q) => q.gte('timestamp', from))
-      .collect();
-
-    const byDay = new Map<
-      string,
-      { date: string; logins: number; sightings: number; views: number; http: number }
-    >();
-    for (const e of rows) {
-      const date = new Date(e.timestamp).toISOString().slice(0, 10);
-      const b = byDay.get(date) ?? { date, logins: 0, sightings: 0, views: 0, http: 0 };
-      if (e.type === 'user.login') b.logins++;
-      else if (e.type === 'sighting.created') b.sightings++;
-      else if (e.type === 'sighting.viewed') b.views++;
-      else if (e.type === 'http.request') b.http++;
-      byDay.set(date, b);
-    }
-
-    return [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date));
-  },
-});

@@ -2,13 +2,20 @@ import { useState } from 'react';
 import { Authenticated, Unauthenticated, useQuery } from 'convex/react';
 import { Link } from 'react-router-dom';
 import { api } from '../convex/_generated/api';
+import { Id } from '../convex/_generated/dataModel';
 import { Card, Metric } from './components/tremor/Card';
 import { AreaChart } from './components/tremor/AreaChart';
 import { BarChart } from './components/tremor/BarChart';
 import { DonutChart } from './components/tremor/DonutChart';
+import { field } from './pickers';
 
 const RANGES = [7, 30, 90];
 const num = (v: number) => v.toLocaleString();
+const ms = (v: number) => `${v} ms`;
+const bytesFmt = (v: number) =>
+  v >= 1e6 ? `${(v / 1e6).toFixed(1)} MB` : v >= 1e3 ? `${(v / 1e3).toFixed(1)} KB` : `${v} B`;
+// 200 → green, 404 → amber, 500 → rose
+const STATUS_COLORS = ['#10b981', '#f59e0b', '#f43f5e', '#6366f1'];
 
 export default function Dashboard() {
   return (
@@ -31,79 +38,270 @@ export default function Dashboard() {
 
 function DashboardBody() {
   const [days, setDays] = useState(30);
-  const summary = useQuery(api.events.dashboardSummary, { days });
-  const byDay = useQuery(api.events.eventsByDay, { days });
-  const byType = useQuery(api.events.usageByType, { windowHours: days * 24 });
-  const http = useQuery(api.events.httpMetrics, { windowHours: days * 24, bucketMinutes: 1440 });
+  return (
+    <div className="flex flex-col gap-10">
+      <div className="flex flex-col gap-4">
+        <div className="flex gap-2">
+          {RANGES.map((r) => (
+            <button
+              key={r}
+              type="button"
+              onClick={() => setDays(r)}
+              className={`text-sm px-3 py-1 rounded-md border-2 ${
+                days === r
+                  ? 'bg-dark dark:bg-light text-light dark:text-dark'
+                  : 'border-slate-300 dark:border-slate-700'
+              }`}
+            >
+              {r}d
+            </button>
+          ))}
+        </div>
+        <KpiStrip days={days} />
+      </div>
+      <HttpSection days={days} />
+      <AppSection />
+    </div>
+  );
+}
 
-  const activity = (byDay ?? []).map((d) => ({ ...d, label: d.date.slice(5) }));
-  const httpDaily = (http ?? []).map((h) => ({
-    ...h,
-    label: new Date(h.bucket).toISOString().slice(5, 10),
-  }));
+function KpiStrip({ days }: { days: number }) {
+  const s = useQuery(api.events.summary, { days });
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+      <Metric label="Total events" value={s ? num(s.totalEvents) : '…'} />
+      <Metric label="Active users" value={s ? num(s.activeUsers) : '…'} />
+      <Metric label="Logins" value={s ? num(s.logins) : '…'} />
+      <Metric label="Sightings" value={s ? num(s.sightingsCreated) : '…'} />
+      <Metric label="HTTP error rate" value={s ? `${(s.httpErrorRate * 100).toFixed(1)}%` : '…'} />
+      <Metric label="Avg latency" value={s ? ms(s.avgLatencyMs) : '…'} />
+    </div>
+  );
+}
+
+function ChartCard({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <Card>
+      <p className="font-bold mb-3">{title}</p>
+      {children}
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP events
+// ---------------------------------------------------------------------------
+
+type DayRow = {
+  date: string;
+  endpoint: string;
+  requests: number;
+  errors: number;
+  responseBytes: number;
+  latencySum: number;
+  latencyCount: number;
+  status: Record<string, number>;
+};
+type ByDay = { endpoints: string[]; statusCodes: number[]; rows: DayRow[] };
+
+/** One row per day, each endpoint as a column (for stacked metrics). */
+function pivotByDay(byDay: ByDay | undefined, metric: 'requests' | 'errors' | 'responseBytes') {
+  if (!byDay) return [];
+  const byDate = new Map<string, Record<string, number | string>>();
+  for (const r of byDay.rows) {
+    let d = byDate.get(r.date);
+    if (!d) {
+      d = { label: r.date.slice(5) };
+      for (const e of byDay.endpoints) d[e] = 0;
+      byDate.set(r.date, d);
+    }
+    d[r.endpoint] = (d[r.endpoint] as number) + r[metric];
+  }
+  return [...byDate.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, v]) => v);
+}
+
+/** Overall avg latency per day (single series). */
+function latencyByDay(byDay: ByDay | undefined) {
+  if (!byDay) return [];
+  const m = new Map<string, { sum: number; count: number }>();
+  for (const r of byDay.rows) {
+    const a = m.get(r.date) ?? { sum: 0, count: 0 };
+    a.sum += r.latencySum;
+    a.count += r.latencyCount;
+    m.set(r.date, a);
+  }
+  return [...m.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, a]) => ({ label: date.slice(5), 'avg latency': a.count ? Math.round(a.sum / a.count) : 0 }));
+}
+
+/** Avg latency per day with one column per endpoint (grouped bars). */
+function latencyGroupedByDay(byDay: ByDay | undefined) {
+  if (!byDay) return [];
+  const byDate = new Map<string, Record<string, number | string>>();
+  for (const r of byDay.rows) {
+    let d = byDate.get(r.date);
+    if (!d) {
+      d = { label: r.date.slice(5) };
+      for (const e of byDay.endpoints) d[e] = 0;
+      byDate.set(r.date, d);
+    }
+    d[r.endpoint] = r.latencyCount ? Math.round(r.latencySum / r.latencyCount) : 0;
+  }
+  return [...byDate.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, v]) => v);
+}
+
+/** Status-code counts per day for a single endpoint (stacked bars). */
+function statusByDay(byDay: ByDay | undefined, endpoint: string) {
+  if (!byDay || !endpoint) return [];
+  const codes = byDay.statusCodes.map(String);
+  return byDay.rows
+    .filter((r) => r.endpoint === endpoint)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((r) => {
+      const row: Record<string, number | string> = { label: r.date.slice(5) };
+      for (const c of codes) row[c] = r.status[c] ?? 0;
+      return row;
+    });
+}
+
+function HttpSection({ days }: { days: number }) {
+  const byDay = useQuery(api.events.httpByDay, { days });
+  const endpoints = byDay?.endpoints ?? [];
+  const statusCodes = (byDay?.statusCodes ?? []).map(String);
+
+  const [statusEndpoint, setStatusEndpoint] = useState('');
+  const activeEndpoint = statusEndpoint || endpoints[0] || '';
 
   return (
-    <div className="flex flex-col gap-6">
-      <div className="flex gap-2">
-        {RANGES.map((r) => (
-          <button
-            key={r}
-            type="button"
-            onClick={() => setDays(r)}
-            className={`text-sm px-3 py-1 rounded-md border-2 ${
-              days === r
-                ? 'bg-dark dark:bg-light text-light dark:text-dark'
-                : 'border-slate-300 dark:border-slate-700'
-            }`}
-          >
-            {r}d
-          </button>
-        ))}
-      </div>
+    <section className="flex flex-col gap-4">
+      <h3 className="text-xl font-bold">HTTP events</h3>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
-        <Metric label="Total events" value={summary ? num(summary.totalEvents) : '…'} />
-        <Metric label="Active users" value={summary ? num(summary.activeUsers) : '…'} />
-        <Metric label="Logins" value={summary ? num(summary.logins) : '…'} />
-        <Metric label="Sightings" value={summary ? num(summary.sightingsCreated) : '…'} />
-        <Metric
-          label="HTTP error rate"
-          value={summary ? `${(summary.httpErrorRate * 100).toFixed(1)}%` : '…'}
-        />
-        <Metric label="Avg latency" value={summary ? `${summary.avgLatencyMs} ms` : '…'} />
-      </div>
-
-      <Card>
-        <p className="font-bold mb-2">Activity over time</p>
+      <ChartCard title="Avg latency / day">
         <AreaChart
-          data={activity}
+          data={latencyByDay(byDay)}
           index="label"
-          categories={['logins', 'sightings', 'views', 'http']}
-          valueFormatter={num}
-        />
-      </Card>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <p className="font-bold mb-2">Event mix</p>
-          <DonutChart data={byType ?? []} category="count" index="type" valueFormatter={num} />
-        </Card>
-        <Card>
-          <p className="font-bold mb-2">HTTP requests / day</p>
-          <BarChart data={httpDaily} index="label" categories={['requests']} valueFormatter={num} />
-        </Card>
-      </div>
-
-      <Card>
-        <p className="font-bold mb-2">Avg HTTP latency / day</p>
-        <AreaChart
-          data={httpDaily}
-          index="label"
-          categories={['avgDurationMs']}
+          categories={['avg latency']}
           colors={['#06b6d4']}
-          valueFormatter={(v) => `${v} ms`}
+          valueFormatter={ms}
+        />
+      </ChartCard>
+
+      <ChartCard title="Avg latency per endpoint, per day">
+        <BarChart data={latencyGroupedByDay(byDay)} index="label" categories={endpoints} valueFormatter={ms} />
+      </ChartCard>
+
+      <ChartCard title="Requests / day by endpoint">
+        <BarChart data={pivotByDay(byDay, 'requests')} index="label" categories={endpoints} valueFormatter={num} stack />
+      </ChartCard>
+
+      <ChartCard title="Errors / day by endpoint">
+        <BarChart data={pivotByDay(byDay, 'errors')} index="label" categories={endpoints} valueFormatter={num} stack />
+      </ChartCard>
+
+      <ChartCard title="Response bytes / day by endpoint">
+        <BarChart data={pivotByDay(byDay, 'responseBytes')} index="label" categories={endpoints} valueFormatter={bytesFmt} stack />
+      </ChartCard>
+
+      <Card>
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <p className="font-bold">Status codes / day</p>
+          <select
+            className={field}
+            value={activeEndpoint}
+            onChange={(e) => setStatusEndpoint(e.target.value)}
+          >
+            {endpoints.map((ep) => (
+              <option key={ep} value={ep}>
+                {ep}
+              </option>
+            ))}
+          </select>
+        </div>
+        <BarChart
+          data={statusByDay(byDay, activeEndpoint)}
+          index="label"
+          categories={statusCodes}
+          colors={STATUS_COLORS}
+          valueFormatter={num}
+          stack
         />
       </Card>
-    </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Application events
+// ---------------------------------------------------------------------------
+
+function AppSection() {
+  const totals = useQuery(api.analytics.observationTotals);
+  const locations = useQuery(api.locations.list) ?? [];
+  const species = useQuery(api.species.list) ?? [];
+
+  const [locId, setLocId] = useState<Id<'locations'> | ''>('');
+  const [spId, setSpId] = useState<Id<'species'> | ''>('');
+  const activeLoc = (locId || locations[0]?._id) as Id<'locations'> | undefined;
+  const activeSp = (spId || species[0]?._id) as Id<'species'> | undefined;
+
+  const perLocation = useQuery(
+    api.analytics.observationsByLocation,
+    activeLoc ? { locationId: activeLoc } : 'skip',
+  );
+  const perSpecies = useQuery(
+    api.analytics.observationsBySpecies,
+    activeSp ? { speciesId: activeSp } : 'skip',
+  );
+
+  return (
+    <section className="flex flex-col gap-4">
+      <h3 className="text-xl font-bold">Application events</h3>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <ChartCard title="Observations by location">
+          <DonutChart data={totals?.byLocation ?? []} category="count" index="name" valueFormatter={num} />
+        </ChartCard>
+        <ChartCard title="Observations by species">
+          <DonutChart data={totals?.bySpecies ?? []} category="count" index="name" valueFormatter={num} />
+        </ChartCard>
+      </div>
+
+      <Card>
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <p className="font-bold">Species observed at location</p>
+          <select
+            className={field}
+            value={activeLoc ?? ''}
+            onChange={(e) => setLocId(e.target.value as Id<'locations'>)}
+          >
+            {locations.map((l) => (
+              <option key={l._id} value={l._id}>
+                {l.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <BarChart data={perLocation ?? []} index="name" categories={['count']} valueFormatter={num} height={340} angleTicks />
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <p className="font-bold">Locations for species</p>
+          <select
+            className={field}
+            value={activeSp ?? ''}
+            onChange={(e) => setSpId(e.target.value as Id<'species'>)}
+          >
+            {species.map((s) => (
+              <option key={s._id} value={s._id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <BarChart data={perSpecies ?? []} index="name" categories={['count']} valueFormatter={num} height={340} angleTicks />
+      </Card>
+    </section>
   );
 }
