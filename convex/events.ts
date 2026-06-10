@@ -210,6 +210,14 @@ const isSynthetic = (e: { metadata?: unknown }) =>
 const endpointLabel = (e: { method?: string; path?: string }) =>
   `${e.method ?? '?'} ${e.path ?? '?'}`;
 
+/** Nearest-rank percentile of a numeric sample. */
+function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+  return sorted[idx];
+}
+
 /**
  * Per-day, per-endpoint HTTP aggregates: requests, errors, bytes, latency, and
  * a status-code breakdown. Drives every HTTP chart (latency grouped-per-day,
@@ -297,8 +305,10 @@ export const summary = query({
     let sightingsCreated = 0;
     let httpRequests = 0;
     let httpErrors = 0;
+    let serverErrors = 0;
     let latencySum = 0;
     let latencyCount = 0;
+    const durations: number[] = [];
     const activeUsers = new Set<string>();
 
     for (const e of rows) {
@@ -308,9 +318,11 @@ export const summary = query({
       else if (e.type === 'http.request') {
         httpRequests++;
         if (e.status === 'error') httpErrors++;
+        if (typeof e.statusCode === 'number' && e.statusCode >= 500) serverErrors++;
         if (typeof e.durationMs === 'number') {
           latencySum += e.durationMs;
           latencyCount++;
+          durations.push(e.durationMs);
         }
       }
     }
@@ -321,8 +333,45 @@ export const summary = query({
       logins,
       sightingsCreated,
       httpErrorRate: httpRequests ? httpErrors / httpRequests : 0,
+      // Health: share of requests that didn't 5xx.
+      successRate: httpRequests ? (httpRequests - serverErrors) / httpRequests : 1,
       avgLatencyMs: latencyCount ? Math.round(latencySum / latencyCount) : 0,
+      p95LatencyMs: percentile(durations, 95),
     };
+  },
+});
+
+/** Per-day latency percentiles (p50/p95/p99) — surfaces tail latency the mean hides. */
+export const latencyPercentilesByDay = query({
+  args: { days: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const from = Date.now() - (args.days ?? 30) * 24 * 60 * 60 * 1000;
+    const rows = (
+      await ctx.db
+        .query('events')
+        .withIndex('by_type_and_timestamp', (q) =>
+          q.eq('type', 'http.request').gte('timestamp', from),
+        )
+        .collect()
+    ).filter(isSynthetic);
+
+    const byDay = new Map<string, number[]>();
+    for (const e of rows) {
+      if (typeof e.durationMs !== 'number') continue;
+      const date = new Date(e.timestamp).toISOString().slice(0, 10);
+      const arr = byDay.get(date) ?? [];
+      arr.push(e.durationMs);
+      byDay.set(date, arr);
+    }
+
+    return [...byDay.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, ds]) => ({
+        date,
+        p50: percentile(ds, 50),
+        p95: percentile(ds, 95),
+        p99: percentile(ds, 99),
+      }));
   },
 });
 

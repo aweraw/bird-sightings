@@ -1,6 +1,8 @@
 import { v } from 'convex/values';
-import { internalAction, internalMutation } from './_generated/server';
+import { FunctionReference } from 'convex/server';
+import { internalAction, internalMutation, QueryCtx } from './_generated/server';
 import { internal } from './_generated/api';
+import { Id } from './_generated/dataModel';
 
 // All functions here are internal: invokable from the CLI (`npx convex run
 // seed:seedAll`) and the dashboard, but never exposed on the public client API.
@@ -138,45 +140,96 @@ export const seedSightings = internalMutation({
   },
 });
 
-/** Teardown: remove synthetic users, their sightings/links, and synthetic
- *  events. Leaves your real account and the catalog intact. Idempotent. */
-export const clearSynthetic = internalMutation({
-  args: {},
-  handler: async (ctx) => {
-    const users = (await ctx.db.query('users').collect()).filter((u) =>
-      u.tokenId.startsWith(SYNTHETIC_PREFIX),
-    );
-    const userIds = new Set(users.map((u) => u._id));
+async function syntheticUserIds(ctx: QueryCtx): Promise<Set<Id<'users'>>> {
+  const users = await ctx.db.query('users').collect();
+  return new Set(users.filter((u) => u.tokenId.startsWith(SYNTHETIC_PREFIX)).map((u) => u._id));
+}
 
-    const sightings = (await ctx.db.query('sighting').collect()).filter((s) =>
-      userIds.has(s.user),
-    );
-    let links = 0;
-    for (const s of sightings) {
-      const ls = await ctx.db
+// Teardown is paginated: a single mutation can only read ~4096 docs, and the
+// events table alone exceeds that. Each batch mutation deletes one page; the
+// clearSynthetic action drives them with a cursor until each table is drained.
+
+const CLEAR_BATCH = 256;
+const cursorArg = { cursor: v.union(v.string(), v.null()) };
+
+/** Delete one page of synthetic events (tagged metadata.synthetic). */
+export const clearSyntheticEvents = internalMutation({
+  args: cursorArg,
+  handler: async (ctx, { cursor }) => {
+    const page = await ctx.db.query('events').paginate({ numItems: CLEAR_BATCH, cursor });
+    let deleted = 0;
+    for (const e of page.page) {
+      if ((e.metadata as { synthetic?: boolean } | undefined)?.synthetic === true) {
+        await ctx.db.delete(e._id);
+        deleted++;
+      }
+    }
+    return { isDone: page.isDone, cursor: page.continueCursor, deleted };
+  },
+});
+
+/** Delete one page of synthetic-user sightings, with their species links. */
+export const clearSyntheticSightings = internalMutation({
+  args: cursorArg,
+  handler: async (ctx, { cursor }) => {
+    const userIds = await syntheticUserIds(ctx);
+    const page = await ctx.db.query('sighting').paginate({ numItems: CLEAR_BATCH, cursor });
+    let deleted = 0;
+    for (const s of page.page) {
+      if (!userIds.has(s.user)) continue;
+      const links = await ctx.db
         .query('sightingSpecies')
         .withIndex('by_sighting', (q) => q.eq('sighting', s._id))
         .collect();
-      for (const l of ls) {
-        await ctx.db.delete(l._id);
-        links++;
-      }
+      for (const l of links) await ctx.db.delete(l._id);
       await ctx.db.delete(s._id);
+      deleted++;
     }
+    return { isDone: page.isDone, cursor: page.continueCursor, deleted };
+  },
+});
 
-    const events = (await ctx.db.query('events').collect()).filter(
-      (e) => (e.metadata as { synthetic?: boolean } | undefined)?.synthetic === true,
-    );
-    for (const e of events) await ctx.db.delete(e._id);
+/** Delete one page of synthetic users. */
+export const clearSyntheticUsers = internalMutation({
+  args: cursorArg,
+  handler: async (ctx, { cursor }) => {
+    const page = await ctx.db.query('users').paginate({ numItems: CLEAR_BATCH, cursor });
+    let deleted = 0;
+    for (const u of page.page) {
+      if (u.tokenId.startsWith(SYNTHETIC_PREFIX)) {
+        await ctx.db.delete(u._id);
+        deleted++;
+      }
+    }
+    return { isDone: page.isDone, cursor: page.continueCursor, deleted };
+  },
+});
 
-    for (const u of users) await ctx.db.delete(u._id);
+type BatchResult = { isDone: boolean; cursor: string | null; deleted: number };
 
-    return {
-      users: users.length,
-      sightings: sightings.length,
-      sightingSpecies: links,
-      events: events.length,
+/** Teardown: remove synthetic events, synthetic-user sightings/links, and
+ *  synthetic users. Leaves your real account and the catalog intact. Idempotent. */
+type ClearBatchRef = FunctionReference<'mutation', 'internal', { cursor: string | null }, BatchResult>;
+
+export const clearSynthetic = internalAction({
+  args: {},
+  handler: async (ctx): Promise<{ events: number; sightings: number; users: number }> => {
+    const drain = async (ref: ClearBatchRef) => {
+      let cursor: string | null = null;
+      let total = 0;
+      for (;;) {
+        const r: BatchResult = await ctx.runMutation(ref, { cursor });
+        total += r.deleted;
+        if (r.isDone) break;
+        cursor = r.cursor;
+      }
+      return total;
     };
+
+    const events = await drain(internal.seed.clearSyntheticEvents);
+    const sightings = await drain(internal.seed.clearSyntheticSightings);
+    const users = await drain(internal.seed.clearSyntheticUsers);
+    return { events, sightings, users };
   },
 });
 

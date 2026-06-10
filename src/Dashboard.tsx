@@ -4,9 +4,9 @@ import { Link } from 'react-router-dom';
 import { api } from '../convex/_generated/api';
 import { Id } from '../convex/_generated/dataModel';
 import { Card, Metric } from './components/tremor/Card';
-import { AreaChart } from './components/tremor/AreaChart';
 import { BarChart } from './components/tremor/BarChart';
 import { DonutChart } from './components/tremor/DonutChart';
+import { LineChart } from './components/tremor/LineChart';
 import { field } from './pickers';
 
 const RANGES = [7, 30, 90];
@@ -68,13 +68,15 @@ function DashboardBody() {
 function KpiStrip({ days }: { days: number }) {
   const s = useQuery(api.events.summary, { days });
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
       <Metric label="Total events" value={s ? num(s.totalEvents) : '…'} />
       <Metric label="Active users" value={s ? num(s.activeUsers) : '…'} />
       <Metric label="Logins" value={s ? num(s.logins) : '…'} />
       <Metric label="Sightings" value={s ? num(s.sightingsCreated) : '…'} />
+      <Metric label="Success rate (non-5xx)" value={s ? `${(s.successRate * 100).toFixed(1)}%` : '…'} />
       <Metric label="HTTP error rate" value={s ? `${(s.httpErrorRate * 100).toFixed(1)}%` : '…'} />
       <Metric label="Avg latency" value={s ? ms(s.avgLatencyMs) : '…'} />
+      <Metric label="p95 latency" value={s ? ms(s.p95LatencyMs) : '…'} />
     </div>
   );
 }
@@ -120,21 +122,6 @@ function pivotByDay(byDay: ByDay | undefined, metric: 'requests' | 'errors' | 'r
   return [...byDate.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, v]) => v);
 }
 
-/** Overall avg latency per day (single series). */
-function latencyByDay(byDay: ByDay | undefined) {
-  if (!byDay) return [];
-  const m = new Map<string, { sum: number; count: number }>();
-  for (const r of byDay.rows) {
-    const a = m.get(r.date) ?? { sum: 0, count: 0 };
-    a.sum += r.latencySum;
-    a.count += r.latencyCount;
-    m.set(r.date, a);
-  }
-  return [...m.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([date, a]) => ({ label: date.slice(5), 'avg latency': a.count ? Math.round(a.sum / a.count) : 0 }));
-}
-
 /** Avg latency per day with one column per endpoint (grouped bars). */
 function latencyGroupedByDay(byDay: ByDay | undefined) {
   if (!byDay) return [];
@@ -165,10 +152,49 @@ function statusByDay(byDay: ByDay | undefined, endpoint: string) {
     });
 }
 
+/** Error rate (%) per day across all endpoints. */
+function errorRateByDay(byDay: ByDay | undefined) {
+  if (!byDay) return [];
+  const m = new Map<string, { req: number; err: number }>();
+  for (const r of byDay.rows) {
+    const a = m.get(r.date) ?? { req: 0, err: 0 };
+    a.req += r.requests;
+    a.err += r.errors;
+    m.set(r.date, a);
+  }
+  return [...m.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, a]) => ({
+      label: date.slice(5),
+      'error %': a.req ? Number(((100 * a.err) / a.req).toFixed(1)) : 0,
+    }));
+}
+
+/** Responses per day bucketed into 2xx / 4xx / 5xx classes. */
+function statusClassByDay(byDay: ByDay | undefined) {
+  if (!byDay) return [];
+  const cls = (code: number) => (code >= 500 ? '5xx' : code >= 400 ? '4xx' : '2xx');
+  const m = new Map<string, Record<string, number | string>>();
+  for (const r of byDay.rows) {
+    let d = m.get(r.date);
+    if (!d) {
+      d = { label: r.date.slice(5), '2xx': 0, '4xx': 0, '5xx': 0 };
+      m.set(r.date, d);
+    }
+    for (const [code, count] of Object.entries(r.status)) {
+      const k = cls(Number(code));
+      d[k] = (d[k] as number) + count;
+    }
+  }
+  return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, v]) => v);
+}
+
 function HttpSection({ days }: { days: number }) {
   const byDay = useQuery(api.events.httpByDay, { days });
+  const pct = useQuery(api.events.latencyPercentilesByDay, { days });
   const endpoints = byDay?.endpoints ?? [];
   const statusCodes = (byDay?.statusCodes ?? []).map(String);
+  const pctData = (pct ?? []).map((d) => ({ label: d.date.slice(5), p50: d.p50, p95: d.p95, p99: d.p99 }));
 
   const [statusEndpoint, setStatusEndpoint] = useState('');
   const activeEndpoint = statusEndpoint || endpoints[0] || '';
@@ -176,32 +202,6 @@ function HttpSection({ days }: { days: number }) {
   return (
     <section className="flex flex-col gap-4">
       <h3 className="text-xl font-bold">HTTP events</h3>
-
-      <ChartCard title="Avg latency / day">
-        <AreaChart
-          data={latencyByDay(byDay)}
-          index="label"
-          categories={['avg latency']}
-          colors={['#06b6d4']}
-          valueFormatter={ms}
-        />
-      </ChartCard>
-
-      <ChartCard title="Avg latency per endpoint, per day">
-        <BarChart data={latencyGroupedByDay(byDay)} index="label" categories={endpoints} valueFormatter={ms} />
-      </ChartCard>
-
-      <ChartCard title="Requests / day by endpoint">
-        <BarChart data={pivotByDay(byDay, 'requests')} index="label" categories={endpoints} valueFormatter={num} stack />
-      </ChartCard>
-
-      <ChartCard title="Errors / day by endpoint">
-        <BarChart data={pivotByDay(byDay, 'errors')} index="label" categories={endpoints} valueFormatter={num} stack />
-      </ChartCard>
-
-      <ChartCard title="Response bytes / day by endpoint">
-        <BarChart data={pivotByDay(byDay, 'responseBytes')} index="label" categories={endpoints} valueFormatter={bytesFmt} stack />
-      </ChartCard>
 
       <Card>
         <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
@@ -227,6 +227,55 @@ function HttpSection({ days }: { days: number }) {
           stack
         />
       </Card>
+
+      <ChartCard title="Errors / day by endpoint">
+        <BarChart data={pivotByDay(byDay, 'errors')} index="label" categories={endpoints} valueFormatter={num} stack />
+      </ChartCard>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <ChartCard title="Error rate / day">
+          <LineChart
+            data={errorRateByDay(byDay)}
+            index="label"
+            categories={['error %']}
+            colors={['#f43f5e']}
+            valueFormatter={(v) => `${v}%`}
+          />
+        </ChartCard>
+        <ChartCard title="Responses by status class / day">
+          <BarChart
+            data={statusClassByDay(byDay)}
+            index="label"
+            categories={['2xx', '4xx', '5xx']}
+            colors={['#10b981', '#f59e0b', '#f43f5e']}
+            valueFormatter={num}
+            stack
+          />
+        </ChartCard>
+      </div>
+
+      <ChartCard title="Avg latency per endpoint, per day">
+        <BarChart data={latencyGroupedByDay(byDay)} index="label" categories={endpoints} valueFormatter={ms} />
+      </ChartCard>
+
+      <ChartCard title="Latency percentiles / day">
+        <LineChart
+          data={pctData}
+          index="label"
+          categories={['p50', 'p95', 'p99']}
+          colors={['#3b82f6', '#f59e0b', '#f43f5e']}
+          valueFormatter={ms}
+        />
+      </ChartCard>
+
+      <ChartCard title="Requests / day by endpoint">
+        <BarChart data={pivotByDay(byDay, 'requests')} index="label" categories={endpoints} valueFormatter={num} stack />
+      </ChartCard>
+
+      <ChartCard title="Response bytes / day by endpoint">
+        <BarChart data={pivotByDay(byDay, 'responseBytes')} index="label" categories={endpoints} valueFormatter={bytesFmt} stack />
+      </ChartCard>
+
     </section>
   );
 }
